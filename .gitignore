@@ -11,3 +11,6 @@ storage/
 .idea
 .conda
 demo-chatbot/node_modules/
+*.json
+!spec/*.json
+.venv/
