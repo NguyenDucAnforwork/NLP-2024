@@ -1,4 +1,31 @@
-beautifulsoup4==4.12.3
-itemadapter==0.9.0
-Requests==2.32.3
-Scrapy==2.11.2
+# Web framework
+gradio>=4.0.0
+flask>=2.0.0
+
+# Core dependencies
+llama-index>=0.9.0
+llama-index-vector-stores-qdrant>=0.1.0
+llama-index-embeddings-huggingface>=0.1.0
+llama-index-llms-gemini>=0.1.0
+llama-index-retrievers-bm25>=0.1.0
+qdrant-client>=1.6.0
+python-dotenv>=1.0.0
+
+# Embeddings and ML
+transformers>=4.34.0
+torch>=2.0.0
+sentence-transformers>=2.2.2
+
+# Web crawling
+beautifulsoup4>=4.12.0
+requests>=2.32.0
+scrapy>=2.11.0
+scrapy-playwright>=0.0.30
+
+# Utilities
+tqdm>=4.66.0
+pyarrow>=14.0.0
+opencv-python-headless>=4.9.0
+pydantic>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0

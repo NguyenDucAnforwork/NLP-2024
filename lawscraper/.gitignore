@@ -1,0 +1,9 @@
+# data folder
+data/
+.vscode/
+.gradio/
+__pycache__/
+.dist/
+__pycache__/
+*.pyc
+storage/
