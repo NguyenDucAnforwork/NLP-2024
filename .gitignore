@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 storage/
 *.env
+.idea
+.conda
