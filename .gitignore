@@ -10,3 +10,4 @@ storage/
 *.env
 .idea
 .conda
+demo-chatbot/node_modules/
