@@ -17,14 +17,29 @@ import time
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
 # Import RAGAS for evaluation
+from ragas import evaluate as evaluate_ragas
 from ragas.metrics import (
-    context_precision,
-    context_recall, 
-    faithfulness,
-    answer_relevancy
+    ContextPrecision, context_precision,
+    ContextRecall, context_recall,
+    Faithfulness, faithfulness,
+    AnswerRelevancy, answer_relevancy,
 )
-from ragas import evaluate
+from ragas.llms import LlamaIndexLLMWrapper
+
+from deepeval import evaluate as evaluate_deepeval
+from deepeval.metrics import (
+    ContextualPrecisionMetric,
+    ContextualRecallMetric,
+    FaithfulnessMetric,
+    AnswerRelevancyMetric
+)
+from deepeval.test_case import LLMTestCase
+from deepeval.models import DeepEvalBaseLLM
 from datasets import Dataset
+from llama_index.llms.google_genai import GoogleGenAI
+from together import Together
+import concurrent.futures
+import threading
 
 # Import our custom modules
 from src.backend.vector_indexes import ParentVectorIndex, ChildVectorIndex
@@ -55,19 +70,70 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-QA_DATA_PATH = os.path.join("qa_data", "qa_pairs_full.json")
+QA_DATA_PATH = "./data/test.jsonl"
 EMBED_MODEL_PATH = "BAAI/bge-m3"
 LOCAL_EMBED_MODEL_PATH = "./data/embeddings/Vietnamese_Embedding"
 PARENT_COLLECTION = "vietnamese_legal_parent"
 LOCAL_PARENT_COLLECTION = "./data/nodes/hienphap_parent.pkl"
 CHILD_COLLECTION = "vietnamese_legal_child"
 LOCAL_CHILD_COLLECTION = "./data/nodes/hienphap_child.pkl"
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemma-3-27b-it"
 TEMPERATURE = 0.1  # Lower temperature for evaluation
 num_generators = 8 # More generators to avoid rate limit
 OUTPUT_DIR = "evaluation_results"
 EVALUATION_SAMPLE_SIZE = 4000  # Number of QA pairs to evaluate
 os.environ["IS_TESTING"] = "1"  # Avoid using LLM for retrieval
+
+
+class EvalGoogleGenAI(DeepEvalBaseLLM):
+    def __init__(self, model_name: str, api_key: str):
+        self.model = GoogleGenAI(
+            model=model_name,
+            api_key=api_key,
+            temperature=TEMPERATURE
+        )
+
+    def get_model_name(self):
+        return "Gemini-2.0-flash"
+    
+    def load_model(self):
+        return self.model
+    
+    def generate(self, query: str):
+        """Generate response using the Gemini model."""
+        response = self.model.complete(query)
+        return response.text.strip()
+    
+    async def a_generate(self, prompt: str) -> str:
+        return self.generate(prompt)
+
+
+class EvalTogetherLLM(DeepEvalBaseLLM):
+    def __init__(self):
+        self.client = Together()
+
+    def get_model_name(self):
+        return "Llama-3.3-70B-Instruct-Turbo-Free"
+    
+    def load_model(self):
+        return self.client
+    
+    def generate(self, query: str):
+        """Generate response using the Together model."""
+        response = self.client.chat.completions.create(
+            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+            messages=[
+            {
+                "role": "user",
+                "content": query
+            }
+            ]
+        )
+        return response.choices[0].message.content
+    
+    async def a_generate(self, prompt: str):
+        return self.generate(prompt)
+
 
 class RAGEvaluator:
     """Class to evaluate RAG pipeline using RAGAS metrics."""
@@ -99,8 +165,8 @@ class RAGEvaluator:
         """Load QA pairs from JSON file."""
         logger.info(f"Loading QA pairs from {QA_DATA_PATH}...")
         try:
-            with open(QA_DATA_PATH, 'r', encoding='utf-8') as f:
-                self.qa_pairs = json.load(f)
+            with open(QA_DATA_PATH, 'r', encoding='utf-8') as file:
+                self.qa_pairs = [json.loads(line) for line in file]
             
             # Sample a subset for evaluation
             if len(self.qa_pairs) > EVALUATION_SAMPLE_SIZE:
@@ -213,14 +279,14 @@ class RAGEvaluator:
         except Exception as e:
             logger.error(f"Error initializing generator: {e}")
             raise
-    
+
 
     def initialize_embed_model(self) -> None:
         """Initialize the embedding model from local path."""
         self.embed_model = HuggingFaceEmbedding(model_name=LOCAL_EMBED_MODEL_PATH)
 
 
-    def setup_retrievers(self, llm=None) -> None:
+    def setup_retrievers(self, top_k=5, llm=None) -> None:
         """Set up different retrieval methods for evaluation using standard LlamaIndex implementations.
         Args:
             llm: Optional LLM instance for retrieval methods that require it
@@ -235,7 +301,7 @@ class RAGEvaluator:
             # 2. BM25 retriever (purely lexical search)
             bm25_retriever = BM25Retriever.from_defaults(
                 docstore=self.storage_context.docstore,
-                similarity_top_k=5
+                similarity_top_k=top_k
             )
             self.retrievers["bm25"] = bm25_retriever
             logger.info("Successfully initialized BM25 retriever")
@@ -245,13 +311,13 @@ class RAGEvaluator:
                 # Create explicit vector retriever
                 vector_retriever_for_fusion = VectorIndexRetriever(
                     index=self.child_index,
-                    similarity_top_k=5
+                    similarity_top_k=top_k
                 )
                 # Create fusion retriever (combines vector and keyword search)
                 fusion_retriever = QueryFusionRetriever(
                     llm=llm, num_queries=4 if llm else 1,
                     retrievers=[vector_retriever_for_fusion, bm25_retriever],
-                    similarity_top_k=5,
+                    similarity_top_k=top_k,
                     mode="reciprocal_rerank",
                 )
                 self.retrievers["hybrid_fusion"] = fusion_retriever
@@ -450,7 +516,10 @@ class RAGEvaluator:
                         break
                     retries = 0
                 try:
-                    response = generator.generate_response(question, retrieved_nodes)
+                    response = generator.generate_response(
+                        query_str=question,
+                        nodes=retrieved_nodes
+                        )
                     answer = response.response.strip()
                     # time.sleep(self.rest_between_gens)  # Respect rate limits
                     done = True
@@ -490,7 +559,156 @@ class RAGEvaluator:
         return data_dict
     
 
-    def evaluate_from_saved_data(self, retriever_name: str) -> Dict[str, float]:
+    def evaluate_from_saved_data_deepeval(self, retriever_name: str) -> Dict[str, float]:
+        """
+        Run DeepEval evaluation using saved generation data with parallel metric evaluation.
+        
+        Args:
+            retriever_name: Name of the retriever to evaluate
+            
+        Returns:
+            Dictionary of metrics
+        """
+        logger.info(f"Running DeepEval evaluation for {retriever_name} from saved data...")
+        
+        # eval_llms = [EvalGoogleGenAI(
+        #     model_name=MODEL_NAME,
+        #     api_key=os.getenv(f"GEMINI_API_KEY_{i}")
+        #     ) for i in range(self.num_generators)]
+
+        eval_llm = EvalTogetherLLM()
+
+        try:
+            # Load generation results
+            gen_file = os.path.join(OUTPUT_DIR, f"generation_results_{retriever_name}.json")
+            with open(gen_file, 'r', encoding='utf-8') as f:
+                gen_data = json.load(f)
+                data_dict = gen_data["data"]
+            
+            logger.info(f"Loaded {len(data_dict['question'])} test cases for evaluation")
+            
+            # Initialize DeepEval metrics with different models
+            metrics_config = {
+                # 'contextual_precision': ContextualPrecisionMetric(
+                #     include_reason=True
+                # ),
+                # 'contextual_recall': ContextualRecallMetric(
+                #     include_reason=True
+                # ),
+                'faithfulness': FaithfulnessMetric(
+                    include_reason=True
+                ),
+                'answer_relevancy': AnswerRelevancyMetric(
+                    include_reason=True
+                )
+            }
+            
+            # Create test cases for DeepEval
+            test_cases = []
+            for i in range(len(data_dict['question'])):
+                test_case = LLMTestCase(
+                    input=data_dict['question'][i],
+                    actual_output=data_dict['answer'][i],
+                    expected_output=data_dict['ground_truth'][i],
+                    retrieval_context=data_dict['contexts'][i]
+                )
+                test_cases.append(test_case)
+            
+            logger.info(f"Created {len(test_cases)} test cases for evaluation")
+            
+            # Function to evaluate a single metric
+            def evaluate_metric(metric_name_and_config):
+                metric_name, metric = metric_name_and_config
+                logger.info(f"Starting evaluation for {metric_name}...")
+                scores = []
+                
+                for test_case in tqdm(test_cases, desc=f"{metric_name}", position=None, leave=True):
+                    while True:
+                        try:
+                            score = metric.measure(test_case, _show_indicator=False)
+                            scores.append(score)
+                            break
+                        except Exception as e:
+                            logger.warning(f"Error evaluating {metric_name} for test case: {e}")
+                            time.sleep(10)
+                
+                logger.info(f"Completed evaluation for {metric_name}")
+                return metric_name, scores
+            
+            # Run all metrics in parallel using ThreadPoolExecutor
+            logger.info("Starting parallel metric evaluation...")
+            results = {}
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                # Submit all metric evaluation tasks
+                future_to_metric = {
+                    executor.submit(evaluate_metric, (name, metric)): name 
+                    for name, metric in metrics_config.items()
+                }
+                
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(future_to_metric):
+                    metric_name = future_to_metric[future]
+                    try:
+                        returned_name, scores = future.result()
+                        results[returned_name] = scores
+                        logger.info(f"✅ Completed {returned_name} evaluation")
+                    except Exception as e:
+                        logger.error(f"❌ Error in {metric_name} evaluation: {e}")
+                        results[metric_name] = [0.0] * len(test_cases)
+            
+            # Calculate average scores
+            metrics = {
+                "context_precision": np.mean(results.get('contextual_precision', [0.0])),
+                "context_recall": np.mean(results.get('contextual_recall', [0.0])),
+                "faithfulness": np.mean(results.get('faithfulness', [0.0])),
+                "answer_relevancy": np.mean(results.get('answer_relevancy', [0.0])),
+            }
+            
+            # Create detailed results DataFrame
+            detailed_results = pd.DataFrame({
+                'question': data_dict['question'],
+                'ground_truth': data_dict['ground_truth'],
+                'answer': data_dict['answer'],
+                'context_precision': results.get('contextual_precision', [0.0] * len(test_cases)),
+                'context_recall': results.get('contextual_recall', [0.0] * len(test_cases)),
+                'faithfulness': results.get('faithfulness', [0.0] * len(test_cases)),
+                'answer_relevancy': results.get('answer_relevancy', [0.0] * len(test_cases))
+            })
+            
+            # Save detailed results to CSV
+            csv_file = os.path.join(OUTPUT_DIR, f"deepeval_results_{retriever_name}.csv")
+            detailed_results.to_csv(csv_file, index=False, encoding='utf-8')
+            logger.info(f"Saved detailed DeepEval results to {csv_file}")
+            
+            # Save summary metrics
+            summary_file = os.path.join(OUTPUT_DIR, f"deepeval_summary_{retriever_name}.json")
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "retriever": retriever_name,
+                    "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    "metrics": metrics,
+                    "num_test_cases": len(test_cases),
+                    "model": MODEL_NAME,
+                    "evaluation_mode": "parallel"
+                }, f, indent=4, ensure_ascii=False)
+            
+            logger.info(f"🎉 DeepEval parallel metrics for {retriever_name}: {metrics}")
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"Error running DeepEval evaluation for {retriever_name}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                "context_precision": 0.0,
+                "context_recall": 0.0,
+                "faithfulness": 0.0,
+                "answer_relevancy": 0.0,
+            }
+
+
+    def evaluate_from_saved_data_ragas(self, retriever_name: str) -> Dict[str, float]:
         """
         Run RAGAS evaluation using saved generation data.
         
@@ -501,6 +719,7 @@ class RAGEvaluator:
             Dictionary of metrics
         """
         logger.info(f"Running RAGAS evaluation for {retriever_name} from saved data...")
+        eval_llms = [LlamaIndexLLMWrapper(llm=self.generators[i].llm) for i in range(4)]
         
         try:
             # Load generation results
@@ -513,19 +732,19 @@ class RAGEvaluator:
             dataset = Dataset.from_dict(data_dict)
             
             # Run RAGAS evaluation
-            result = evaluate(
+            result = evaluate_ragas(
                 dataset,
                 metrics=[
-                    context_precision,
-                    context_recall,
-                    faithfulness,
-                    answer_relevancy,
+                    ContextPrecision(llm=eval_llms[0]),
+                    ContextRecall(llm=eval_llms[1]),
+                    Faithfulness(llm=eval_llms[2]),
+                    AnswerRelevancy(llm=eval_llms[3], embeddings=self.embed_model),
                 ]
             )
             
             # Save results to pandas DataFrame and to csv file
-            df = result.to_pandas()
             csv_file = os.path.join(OUTPUT_DIR, f"ragas_results_{retriever_name}.csv")
+            df = result.to_pandas()
             df.to_csv(csv_file, index=False)
             
             # Extract scores
@@ -547,7 +766,7 @@ class RAGEvaluator:
                 "faithfulness": 0.0,
                 "answer_relevancy": 0.0,
             }
-    
+
 
     def run_retrieval_phase(self) -> None:
         """Run the retrieval phase for all retrievers."""
@@ -589,7 +808,7 @@ class RAGEvaluator:
         
         for retriever_name in retriever_names:
             logger.info(f"Evaluating {retriever_name}...")
-            metrics = self.evaluate_from_saved_data(retriever_name)
+            metrics = self.evaluate_from_saved_data_ragas(retriever_name)
             self.evaluation_results[retriever_name] = metrics
         
         # Save results
@@ -948,11 +1167,12 @@ def main():
     """Main function to run the evaluation."""
     try:
         evaluator = RAGEvaluator()
+
         evaluator.initialize_generators()
         evaluator.initialize_embed_model()
-        # evaluator.load_qa_data()
-        evaluator.load_indexes(load_from='local')
-        evaluator.setup_retrievers()
+        evaluator.load_qa_data()
+        # evaluator.load_indexes(load_from='local')
+        # evaluator.setup_retrievers()
 
         # You can run these phases independently:
         
@@ -965,9 +1185,9 @@ def main():
         
         # Phase 3: Evaluation (can be run after generation is complete)
         # Comment out if you only want to do retrieval and/or generation
-        # evaluator.run_evaluation_phase()
+        evaluator.run_evaluation_phase(retriever_names=['vector'])
         
-        logger.info("Evaluation completed successfully!")
+        # logger.info("Evaluation completed successfully!")
     except Exception as e:
         logger.error(f"Error running evaluation: {e}")
         import traceback
