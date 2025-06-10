@@ -14,3 +14,6 @@ demo-chatbot/node_modules/
 *.json
 !spec/*.json
 .venv/
+*.json
+!spec/*.json
+.venv/
